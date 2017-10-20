@@ -14,11 +14,24 @@
 
 package io.confluent.connect.hdfs;
 
+import io.confluent.common.utils.Time;
+import io.confluent.connect.avro.AvroData;
+import io.confluent.connect.hdfs.errors.HiveMetaStoreException;
+import io.confluent.connect.hdfs.filter.CommittedFileFilter;
+import io.confluent.connect.hdfs.filter.TopicPartitionCommittedFileFilter;
+import io.confluent.connect.hdfs.hive.HiveMetaStore;
+import io.confluent.connect.hdfs.hive.HiveUtil;
+import io.confluent.connect.hdfs.partitioner.Partitioner;
+import io.confluent.connect.hdfs.schema.Compatibility;
+import io.confluent.connect.hdfs.schema.SchemaUtils;
+import io.confluent.connect.hdfs.storage.Storage;
+import io.confluent.connect.hdfs.wal.WAL;
+import io.confluent.connect.storage.partitioner.TimeBasedPartitioner;
+import io.confluent.connect.storage.partitioner.TimestampExtractor;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.IllegalWorkerStateException;
@@ -43,20 +56,10 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 
-import io.confluent.connect.avro.AvroData;
-import io.confluent.connect.hdfs.errors.HiveMetaStoreException;
-import io.confluent.connect.hdfs.filter.CommittedFileFilter;
-import io.confluent.connect.hdfs.filter.TopicPartitionCommittedFileFilter;
-import io.confluent.connect.hdfs.hive.HiveMetaStore;
-import io.confluent.connect.hdfs.hive.HiveUtil;
-import io.confluent.connect.hdfs.partitioner.Partitioner;
-import io.confluent.connect.hdfs.schema.Compatibility;
-import io.confluent.connect.hdfs.schema.SchemaUtils;
-import io.confluent.connect.hdfs.storage.Storage;
-import io.confluent.connect.hdfs.wal.WAL;
-
 public class TopicPartitionWriter {
   private static final Logger log = LoggerFactory.getLogger(TopicPartitionWriter.class);
+  private final TimestampExtractor timestampExtractor = new TimeBasedPartitioner.RecordTimestampExtractor();
+
   private WAL wal;
   private Map<String, String> tempFiles;
   private Map<String, RecordWriter<SinkRecord>> writers;
@@ -64,6 +67,7 @@ public class TopicPartitionWriter {
   private Partitioner partitioner;
   private String url;
   private String topicsDir;
+  private final Time time;
   private State state;
   private Queue<SinkRecord> buffer;
   private boolean recovered;
@@ -72,7 +76,7 @@ public class TopicPartitionWriter {
   private int recordCounter;
   private int flushSize;
   private long rotateIntervalMs;
-  private long lastRotate;
+  private Long lastRotate;
   private long rotateScheduleIntervalMs;
   private long nextScheduledRotate;
   private RecordWriterProvider writerProvider;
@@ -108,8 +112,9 @@ public class TopicPartitionWriter {
       Partitioner partitioner,
       HdfsSinkConnectorConfig connectorConfig,
       SinkTaskContext context,
-      AvroData avroData) {
-    this(tp, storage, writerProvider, partitioner, connectorConfig, context, avroData, null, null, null, null, null);
+      AvroData avroData,
+      Time time) {
+    this(tp, storage, writerProvider, partitioner, connectorConfig, context, avroData, null, null, null, null, null, time);
   }
 
   public TopicPartitionWriter(
@@ -124,7 +129,9 @@ public class TopicPartitionWriter {
       HiveUtil hive,
       SchemaFileReader schemaFileReader,
       ExecutorService executorService,
-      Queue<Future<Void>> hiveUpdateFutures) {
+      Queue<Future<Void>> hiveUpdateFutures,
+      Time time) {
+    this.time = time;
     this.tp = tp;
     this.connectorConfig = connectorConfig;
     this.context = context;
@@ -178,7 +185,7 @@ public class TopicPartitionWriter {
     }
 
     // Initialize rotation timers
-    updateRotationTimers();
+    updateRotationTimers(null);
   }
 
   private enum State {
@@ -233,13 +240,15 @@ public class TopicPartitionWriter {
     return true;
   }
 
-  private void updateRotationTimers() {
-    lastRotate = System.currentTimeMillis();
+  private void updateRotationTimers(SinkRecord currentRecord) {
+    long now = time.milliseconds();
+    lastRotate = currentRecord != null ? timestampExtractor.extract(currentRecord) : null;
+
     if(log.isDebugEnabled() && rotateIntervalMs > 0) {
       log.debug("Update last rotation timer. Next rotation for {} will be in {}ms", tp, rotateIntervalMs);
     }
     if (rotateScheduleIntervalMs > 0) {
-      nextScheduledRotate = DateTimeUtils.getNextTimeAdjustedByDay(lastRotate, rotateScheduleIntervalMs, timeZone);
+      nextScheduledRotate = DateTimeUtils.getNextTimeAdjustedByDay(now, rotateScheduleIntervalMs, timeZone);
       if (log.isDebugEnabled()) {
         log.debug("Update scheduled rotation timer. Next rotation for {} will be at {}", tp, new DateTime(nextScheduledRotate).withZone(timeZone).toString());
       }
@@ -248,7 +257,8 @@ public class TopicPartitionWriter {
 
   @SuppressWarnings("fallthrough")
   public void write() {
-    long now = System.currentTimeMillis();
+    long now = time.milliseconds();
+    SinkRecord currentRecord = null;
     if (failureTime > 0 && now - failureTime < timeoutMs) {
       return;
     }
@@ -257,7 +267,7 @@ public class TopicPartitionWriter {
       if (!success) {
         return;
       }
-      updateRotationTimers();
+      updateRotationTimers(null);
     }
     while(!buffer.isEmpty()) {
       try {
@@ -277,6 +287,7 @@ public class TopicPartitionWriter {
               }
             }
             SinkRecord record = buffer.peek();
+            currentRecord = record;
             Schema valueSchema = record.valueSchema();
             if (SchemaUtils.shouldChangeSchema(valueSchema, currentSchema, compatibility)) {
               currentSchema = valueSchema;
@@ -290,20 +301,20 @@ public class TopicPartitionWriter {
                 break;
               }
             } else {
-              SinkRecord projectedRecord = SchemaUtils.project(record, currentSchema, compatibility);
-              writeRecord(projectedRecord);
-              buffer.poll();
-              if (shouldRotate(now)) {
+              if (shouldRotateAndMaybeUpdateTimers(currentRecord, now)) {
                 log.info("Starting commit and rotation for topic partition {} with start offsets {}"
                          + " and end offsets {}", tp, startOffsets, offsets);
                 nextState();
                 // Fall through and try to rotate immediately
               } else {
+                SinkRecord projectedRecord = SchemaUtils.project(record, currentSchema, compatibility);
+                writeRecord(projectedRecord);
+                buffer.poll();
                 break;
               }
             }
           case SHOULD_ROTATE:
-            updateRotationTimers();
+            updateRotationTimers(currentRecord);
             closeTempFile();
             nextState();
           case TEMP_FILE_CLOSED:
@@ -322,16 +333,16 @@ public class TopicPartitionWriter {
         throw new RuntimeException(e);
       } catch (IOException | ConnectException e) {
         log.error("Exception on topic partition {}: ", tp, e);
-        failureTime = System.currentTimeMillis();
+        failureTime = time.milliseconds();
         setRetryTimeout(timeoutMs);
         break;
       }
     }
     if (buffer.isEmpty()) {
       // committing files after waiting for rotateIntervalMs time but less than flush.size records available
-      if (recordCounter > 0 && shouldRotate(now)) {
+      if (recordCounter > 0 && shouldRotateAndMaybeUpdateTimers(currentRecord, now)) {
         log.info("committing files after waiting for rotateIntervalMs time but less than flush.size records available.");
-        updateRotationTimers();
+        updateRotationTimers(currentRecord);
 
         try {
           closeTempFile();
@@ -339,7 +350,7 @@ public class TopicPartitionWriter {
           commitFile();
         } catch (IOException e) {
           log.error("Exception on topic partition {}: ", tp, e);
-          failureTime = System.currentTimeMillis();
+          failureTime = time.milliseconds();
           setRetryTimeout(timeoutMs);
         }
       }
@@ -419,8 +430,18 @@ public class TopicPartitionWriter {
     this.state = state;
   }
 
-  private boolean shouldRotate(long now) {
-    boolean periodicRotation = rotateIntervalMs > 0 && now - lastRotate >= rotateIntervalMs;
+  private boolean shouldRotateAndMaybeUpdateTimers(SinkRecord currentRecord, long now) {
+    Long currentTimestamp = null;
+    if (currentRecord != null) {
+      currentTimestamp = timestampExtractor.extract(currentRecord);
+      lastRotate = lastRotate == null ? currentTimestamp : lastRotate;
+    }
+
+    boolean periodicRotation = rotateIntervalMs > 0
+            && currentTimestamp != null
+            && lastRotate != null
+            && currentTimestamp - lastRotate >= rotateIntervalMs;
+
     boolean scheduledRotation = rotateScheduleIntervalMs > 0 && now >= nextScheduledRotate;
     boolean messageSizeRotation = recordCounter >= flushSize;
 

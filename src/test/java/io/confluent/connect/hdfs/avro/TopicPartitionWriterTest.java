@@ -14,6 +14,21 @@
 
 package io.confluent.connect.hdfs.avro;
 
+import io.confluent.common.utils.MockTime;
+import io.confluent.connect.hdfs.FileUtils;
+import io.confluent.connect.hdfs.Format;
+import io.confluent.connect.hdfs.HdfsSinkConnectorConfig;
+import io.confluent.connect.hdfs.RecordWriterProvider;
+import io.confluent.connect.hdfs.TestWithMiniDFSCluster;
+import io.confluent.connect.hdfs.TopicPartitionWriter;
+import io.confluent.connect.hdfs.filter.CommittedFileFilter;
+import io.confluent.connect.hdfs.partitioner.DefaultPartitioner;
+import io.confluent.connect.hdfs.partitioner.FieldPartitioner;
+import io.confluent.connect.hdfs.partitioner.Partitioner;
+import io.confluent.connect.hdfs.partitioner.TimeBasedPartitioner;
+import io.confluent.connect.hdfs.partitioner.TimeUtils;
+import io.confluent.connect.hdfs.storage.Storage;
+import io.confluent.connect.hdfs.storage.StorageFactory;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.kafka.connect.data.Schema;
@@ -33,31 +48,18 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
-import io.confluent.connect.hdfs.FileUtils;
-import io.confluent.connect.hdfs.Format;
-import io.confluent.connect.hdfs.HdfsSinkConnectorConfig;
-import io.confluent.connect.hdfs.RecordWriterProvider;
-import io.confluent.connect.hdfs.TestWithMiniDFSCluster;
-import io.confluent.connect.hdfs.TopicPartitionWriter;
-import io.confluent.connect.hdfs.filter.CommittedFileFilter;
-import io.confluent.connect.hdfs.partitioner.DefaultPartitioner;
-import io.confluent.connect.hdfs.partitioner.FieldPartitioner;
-import io.confluent.connect.hdfs.partitioner.Partitioner;
-import io.confluent.connect.hdfs.partitioner.TimeBasedPartitioner;
-import io.confluent.connect.hdfs.partitioner.TimeUtils;
-import io.confluent.connect.hdfs.storage.Storage;
-import io.confluent.connect.hdfs.storage.StorageFactory;
-
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 public class TopicPartitionWriterTest extends TestWithMiniDFSCluster {
   private RecordWriterProvider writerProvider;
   private Storage storage;
+  private MockTime time;
 
   @Before
   public void setUp() throws Exception {
     super.setUp();
+    time = new MockTime();
 
     @SuppressWarnings("unchecked")
     Format format = ((Class<Format>) Class.forName(connectorConfig.getString(HdfsSinkConnectorConfig.FORMAT_CLASS_CONFIG))).newInstance();
@@ -79,7 +81,7 @@ public class TopicPartitionWriterTest extends TestWithMiniDFSCluster {
     connectorProps.put(HdfsSinkConnectorConfig.FILENAME_OFFSET_ZERO_PAD_WIDTH_CONFIG, "2");
     configureConnector();
     TopicPartitionWriter topicPartitionWriter = new TopicPartitionWriter(
-        TOPIC_PARTITION, storage, writerProvider, partitioner,  connectorConfig, context, avroData);
+        TOPIC_PARTITION, storage, writerProvider, partitioner,  connectorConfig, context, avroData, time);
 
     Schema schema = createSchema();
     List<Struct> records = createRecordBatches(schema, 3, 3);
@@ -116,7 +118,7 @@ public class TopicPartitionWriterTest extends TestWithMiniDFSCluster {
     String partitionField = (String) config.get(HdfsSinkConnectorConfig.PARTITION_FIELD_NAME_CONFIG);
 
     TopicPartitionWriter topicPartitionWriter = new TopicPartitionWriter(
-        TOPIC_PARTITION, storage, writerProvider, partitioner, connectorConfig, context, avroData);
+        TOPIC_PARTITION, storage, writerProvider, partitioner, connectorConfig, context, avroData, time);
 
     Schema schema = createSchema();
     List<Struct> records = new ArrayList<>();
@@ -158,7 +160,7 @@ public class TopicPartitionWriterTest extends TestWithMiniDFSCluster {
     partitioner.configure(config);
 
     TopicPartitionWriter topicPartitionWriter = new TopicPartitionWriter(
-        TOPIC_PARTITION, storage, writerProvider, partitioner, connectorConfig, context, avroData);
+        TOPIC_PARTITION, storage, writerProvider, partitioner, connectorConfig, context, avroData, time);
 
     Schema schema = createSchema();
     List<Struct> records = createRecordBatches(schema, 3, 3);

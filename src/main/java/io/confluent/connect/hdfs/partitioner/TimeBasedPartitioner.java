@@ -14,6 +14,8 @@
 
 package io.confluent.connect.hdfs.partitioner;
 
+import io.confluent.connect.hdfs.HdfsSinkConnectorConfig;
+import io.confluent.connect.storage.partitioner.TimestampExtractor;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 import org.apache.kafka.common.config.ConfigException;
@@ -30,9 +32,8 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import io.confluent.connect.hdfs.HdfsSinkConnectorConfig;
-
 public class TimeBasedPartitioner implements Partitioner {
+  private final TimestampExtractor timestampExtractor = new io.confluent.connect.storage.partitioner.TimeBasedPartitioner.RecordTimestampExtractor();
 
   // Duration of a partition in milliseconds.
   private long partitionDurationMs;
@@ -93,7 +94,7 @@ public class TimeBasedPartitioner implements Partitioner {
 
   @Override
   public String encodePartition(SinkRecord sinkRecord) {
-    long timestamp = System.currentTimeMillis();
+    long timestamp = timestampExtractor.extract(sinkRecord);
     DateTime bucket = new DateTime(getPartition(partitionDurationMs, timestamp, formatter.getZone()));
     return bucket.toString(formatter);
   }

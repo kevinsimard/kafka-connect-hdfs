@@ -14,6 +14,16 @@
 
 package io.confluent.connect.hdfs;
 
+import io.confluent.common.utils.SystemTime;
+import io.confluent.common.utils.Time;
+import io.confluent.connect.avro.AvroData;
+import io.confluent.connect.hdfs.filter.CommittedFileFilter;
+import io.confluent.connect.hdfs.filter.TopicCommittedFileFilter;
+import io.confluent.connect.hdfs.hive.HiveMetaStore;
+import io.confluent.connect.hdfs.hive.HiveUtil;
+import io.confluent.connect.hdfs.partitioner.Partitioner;
+import io.confluent.connect.hdfs.storage.Storage;
+import io.confluent.connect.hdfs.storage.StorageFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
@@ -45,17 +55,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
-import io.confluent.connect.avro.AvroData;
-import io.confluent.connect.hdfs.filter.CommittedFileFilter;
-import io.confluent.connect.hdfs.filter.TopicCommittedFileFilter;
-import io.confluent.connect.hdfs.hive.HiveMetaStore;
-import io.confluent.connect.hdfs.hive.HiveUtil;
-import io.confluent.connect.hdfs.partitioner.Partitioner;
-import io.confluent.connect.hdfs.storage.Storage;
-import io.confluent.connect.hdfs.storage.StorageFactory;
-
 public class DataWriter {
   private static final Logger log = LoggerFactory.getLogger(DataWriter.class);
+  private static final Time SYSTEM_TIME = new SystemTime();
+  private final Time time;
 
   private Map<TopicPartition, TopicPartitionWriter> topicPartitionWriters;
   private String url;
@@ -79,12 +82,17 @@ public class DataWriter {
   private boolean hiveIntegration;
   private Thread ticketRenewThread;
   private volatile boolean isRunning;
-
+  
   public DataWriter(HdfsSinkConnectorConfig connectorConfig, SinkTaskContext context, AvroData avroData) {
+    this(connectorConfig, context, avroData, SYSTEM_TIME);
+  }
+
+  public DataWriter(HdfsSinkConnectorConfig connectorConfig, SinkTaskContext context, AvroData avroData, Time time) {
     try {
       String hadoopHome = connectorConfig.getString(HdfsSinkConnectorConfig.HADOOP_HOME_CONFIG);
       System.setProperty("hadoop.home.dir", hadoopHome);
 
+      this.time = time;
       this.connectorConfig = connectorConfig;
       this.avroData = avroData;
       this.context = context;
@@ -193,7 +201,7 @@ public class DataWriter {
       for (TopicPartition tp: assignment) {
         TopicPartitionWriter topicPartitionWriter = new TopicPartitionWriter(
             tp, storage, writerProvider, partitioner, connectorConfig, context, avroData, hiveMetaStore, hive, schemaFileReader, executorService,
-            hiveUpdateFutures);
+            hiveUpdateFutures, time);
         topicPartitionWriters.put(tp, topicPartitionWriter);
       }
     } catch (ClassNotFoundException | IllegalAccessException | InstantiationException e) {
@@ -274,7 +282,7 @@ public class DataWriter {
     for (TopicPartition tp: assignment) {
       TopicPartitionWriter topicPartitionWriter = new TopicPartitionWriter(
           tp, storage, writerProvider, partitioner, connectorConfig, context, avroData,
-          hiveMetaStore, hive, schemaFileReader, executorService, hiveUpdateFutures);
+          hiveMetaStore, hive, schemaFileReader, executorService, hiveUpdateFutures, time);
       topicPartitionWriters.put(tp, topicPartitionWriter);
       // We need to immediately start recovery to ensure we pause consumption of messages for the
       // assigned topics while we try to recover offsets and rewind.
